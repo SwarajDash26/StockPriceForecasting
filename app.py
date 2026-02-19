@@ -1,242 +1,246 @@
+import os
+import json
+from datetime import datetime, timedelta
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from datetime import datetime, timedelta
 import joblib
+import matplotlib.pyplot as plt
 from tensorflow.keras.models import load_model
 
-# Import your utility functions
 from utils.data_loader import get_stock_data
 from utils.feature_engineer import add_technical_indicators
-from utils.preprocess import create_target, prepare_data_for_lstm
-
-# Page configuration
-st.set_page_config(
-    page_title="Stock Price Forecaster",
-    page_icon="📈",
-    layout="wide"
+from utils.sentiment import (
+    fetch_yfinance_headlines,
+    score_headlines_vader,
+    summarize_sentiment_until_date,
 )
 
-# Title and description
-st.title("📈 Stock Price Prediction with LSTM")
-st.markdown("""
-This app predicts stock price movements 5 days into the future using a deep learning LSTM model.
-Select a stock ticker and date to get started!
-""")
+# -----------------------------
+# Config
+# -----------------------------
+st.set_page_config(page_title="Stock Price Forecaster (DL + Sentiment)", layout="wide")
 
-# Sidebar for user input
-st.sidebar.header("User Input Parameters")
+N_STEPS = 60
+FUTURE_DAYS = 5
 
-# Stock ticker input
-ticker = st.sidebar.text_input("Stock Ticker Symbol", "AAPL").upper()
 
-enable_backtest = st.sidebar.checkbox("Enable Backtesting (compare with actual 5-day future price)")
+# -----------------------------
+# Helpers
+# -----------------------------
+def _artifact_paths(ticker: str):
+    return {
+        "model": f"models/{ticker}_lstm_model.keras",
+        "scaler": f"models/{ticker}_scaler.pkl",
+        "cols": f"models/{ticker}_feature_columns.json",
+        "meta": f"models/{ticker}_error_std.json",
+    }
 
-# Date input with reasonable defaults
-end_date = st.sidebar.date_input(
+
+def load_artifacts(ticker: str):
+    paths = _artifact_paths(ticker)
+    missing = [k for k, p in paths.items() if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(
+            "Missing required artifacts for this ticker:\n"
+            + "\n".join([f"- {k}: {paths[k]}" for k in missing])
+            + "\n\nTrain first, e.g.:\n"
+            + f"  python -c \"from train_model import train_stock_model; train_stock_model('{ticker}', epochs=10)\""
+        )
+
+    model = load_model(paths["model"])
+    scaler = joblib.load(paths["scaler"])
+
+    with open(paths["cols"], "r", encoding="utf-8") as f:
+        feature_columns = json.load(f)["feature_columns"]
+
+    with open(paths["meta"], "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    error_std = float(meta.get("error_std", 0.0))
+    ci95 = float(meta.get("ci95", 0.0))
+
+    return model, scaler, feature_columns, error_std, ci95
+
+
+@st.cache_data(show_spinner=False)
+def load_feature_dataframe(ticker: str, prediction_date: datetime.date) -> pd.DataFrame:
+    raw = get_stock_data(ticker, prediction_date)
+    feats = add_technical_indicators(raw)
+    return feats
+
+
+@st.cache_data(show_spinner=False)
+def load_scored_headlines(ticker: str, max_items: int = 50) -> pd.DataFrame:
+    h = fetch_yfinance_headlines(ticker, max_items=max_items)
+    hs = score_headlines_vader(h)
+    return hs
+
+
+def predict_return(model, scaler, feature_columns, feats_df: pd.DataFrame) -> float:
+    """
+    Uses the last N_STEPS rows of feats_df to predict FUTURE_DAYS return.
+    """
+    if len(feats_df) < N_STEPS:
+        raise ValueError(f"Not enough feature rows ({len(feats_df)}) to build a {N_STEPS}-step sequence.")
+
+    # Enforce exact column order used in training
+    missing = [c for c in feature_columns if c not in feats_df.columns]
+    if missing:
+        raise ValueError(f"Feature columns missing at inference: {missing}")
+
+    latest = feats_df[feature_columns].iloc[-N_STEPS:].copy()
+    scaled = scaler.transform(latest.values)
+    seq = scaled.reshape(1, N_STEPS, len(feature_columns))
+
+    pred = float(model.predict(seq, verbose=0)[0][0])
+    return pred
+
+
+def price_from_return(current_price: float, predicted_return: float) -> float:
+    return float(current_price * (1.0 + predicted_return))
+
+
+# -----------------------------
+# UI
+# -----------------------------
+st.title("Stock Price Forecaster (Deep Learning + Sentiment)")
+st.caption(
+    "Predicts the *5-day return* using an LSTM trained on OHLCV + core technical indicators. "
+    "Adds a simple news headline sentiment layer for a demo-friendly hybrid forecast."
+)
+
+st.sidebar.header("Inputs")
+
+ticker = st.sidebar.text_input("Ticker", "AAPL").upper().strip()
+
+# Default prediction date: 10 days ago (helps ensure future data exists for backtest)
+prediction_date = st.sidebar.date_input(
     "Prediction Date",
-    datetime.now() - timedelta(days=10),  # Default to 10 days ago to ensure data availability
-    max_value=datetime.now() - timedelta(days=5)  # Can't predict today since we need latest data
+    datetime.now().date() - timedelta(days=10),
+    max_value=datetime.now().date() - timedelta(days=5),
 )
 
-# Main processing function
-def make_prediction(ticker, prediction_date):
-    """Main function to load data, process, train if needed, and make prediction"""
+enable_backtest = st.sidebar.checkbox("Enable backtest (compare to actual close 5 business days later)", value=True)
 
-    # Display progress
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+st.sidebar.subheader("Sentiment Settings")
+sentiment_days_back = st.sidebar.slider("Lookback window for headlines (days)", 1, 14, 7)
+sentiment_alpha = st.sidebar.slider(
+    "Sentiment influence (alpha)",
+    0.0, 0.10, 0.02, 0.005,
+    help="Adjusted return = LSTM_return + alpha * mean_compound_sentiment (compound in [-1,1])",
+)
+
+run_btn = st.sidebar.button("Run Forecast")
+
+
+if run_btn:
+    if not ticker:
+        st.error("Please enter a ticker.")
+        st.stop()
 
     try:
-        status_text.text("Loading historical data...")
-        data = get_stock_data(ticker, prediction_date)
-        progress_bar.progress(20)
+        with st.spinner("Loading model artifacts..."):
+            model, scaler, feature_columns, error_std, ci95 = load_artifacts(ticker)
 
-        status_text.text("Engineering features...")
-        featured_data = add_technical_indicators(data)
-        progress_bar.progress(40)
+        with st.spinner("Loading price data and engineering features..."):
+            feats = load_feature_dataframe(ticker, prediction_date)
 
-        status_text.text("Creating prediction target...")
-        data_with_target = create_target(featured_data, future_days=5)
-        progress_bar.progress(60)
+        with st.spinner("Predicting with LSTM..."):
+            pred_return = predict_return(model, scaler, feature_columns, feats)
 
-        # Try loading pre-trained model and scaler
-        try:
-            model = load_model(f'models/{ticker}_lstm_model.keras')
-            scaler = joblib.load(f'models/{ticker}_scaler.pkl')
-            status_text.text(f"Loaded pre-trained model for {ticker}")
-        except:
-            # If missing → train dynamically
-            st.warning(f"No pre-trained model found for {ticker}. Training a new one now...")
+        # Current price (last close in features df)
+        current_close = float(feats["Close"].iloc[-1])
+        pred_price = price_from_return(current_close, pred_return)
 
-            from train_model import train_stock_model
-            with st.spinner(f"Training LSTM model for {ticker}... This may take a few minutes"):
-                model, history, test_mae = train_stock_model(
-                    ticker=ticker,
-                    prediction_date=prediction_date,
-                    future_days=5,
-                    n_steps=60
-                )
+        # Confidence band (simple residual-based proxy from training holdout)
+        lower_price = price_from_return(current_close, pred_return - ci95)
+        upper_price = price_from_return(current_close, pred_return + ci95)
 
-            # Reload scaler after training
-            scaler = joblib.load(f'models/{ticker}_scaler.pkl')
-            status_text.text(f"Training complete. Model ready for {ticker}!")
+        # --- Sentiment ---
+        with st.spinner("Fetching headlines and scoring sentiment..."):
+            headlines_scored = load_scored_headlines(ticker, max_items=60)
+            sent_summary = summarize_sentiment_until_date(
+                headlines_scored, prediction_date, max_days_back=sentiment_days_back
+            )
 
-        # Prepare the most recent sequence for prediction
-        latest_features = featured_data.iloc[-60:].copy()  # Last 60 days
-        scaled_features = scaler.transform(latest_features)
-        sequence = scaled_features.reshape(1, 60, -1)  # Reshape for LSTM
+        adjusted_return = pred_return + sentiment_alpha * sent_summary.mean_compound
+        adjusted_price = price_from_return(current_close, adjusted_return)
 
-        # Make prediction
-        status_text.text("Making prediction...")
-        predicted_pct_change = model.predict(sequence, verbose=0)[0][0]
+        # -----------------------------
+        # Results
+        # -----------------------------
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Current Close", f"${current_close:,.2f}")
+        c2.metric("LSTM Predicted 5D Return", f"{pred_return:+.2%}")
+        c3.metric("LSTM Predicted Price (5D)", f"${pred_price:,.2f}")
+        c4.metric("95% Range (Price)", f"${lower_price:,.2f} – ${upper_price:,.2f}")
 
-        progress_bar.progress(100)
-        status_text.text("Prediction complete!")
+        st.subheader("Sentiment (News Headlines)")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Headline Count", f"{sent_summary.headline_count}")
+        s2.metric("Mean Compound", f"{sent_summary.mean_compound:+.3f}")
+        s3.metric("Pos / Neu / Neg", f"{sent_summary.pos_frac:.0%} / {sent_summary.neu_frac:.0%} / {sent_summary.neg_frac:.0%}")
+        s4.metric("Sentiment-Adjusted Price (5D)", f"${adjusted_price:,.2f}", delta=f"{adjusted_return:+.2%}")
 
-        return data, predicted_pct_change, latest_features
+        if sent_summary.headline_count == 0:
+            st.info("No headlines found in the lookback window (or yfinance returned none). Sentiment adjustment will be ~0.")
+
+        # Show headlines table
+        if len(headlines_scored) > 0:
+            st.write("Recent headlines (scored):")
+            show_df = headlines_scored.copy()
+            show_df["published_at"] = pd.to_datetime(show_df["published_at"]).dt.strftime("%Y-%m-%d %H:%M UTC")
+            st.dataframe(show_df[["published_at", "source", "compound", "title"]].head(15), use_container_width=True)
+
+        # Price chart
+        st.subheader("Price History + Forecast Markers")
+        fig, ax = plt.subplots(figsize=(12, 5))
+        recent = feats.tail(120)
+        ax.plot(recent.index, recent["Close"], label="Close", linewidth=2)
+        ax.axhline(current_close, linestyle="--", color="gray", alpha=0.7, label="Current Close")
+        ax.axhline(pred_price, linestyle="--", color="green", alpha=0.8, label="Predicted Price (LSTM)")
+        ax.axhline(adjusted_price, linestyle="--", color="blue", alpha=0.8, label="Predicted Price (Adj)")
+
+        ax.set_title(f"{ticker} Close Price (recent) and 5D Forecast")
+        ax.set_xlabel("Date")
+        ax.set_ylabel("Price")
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        st.pyplot(fig)
+
+        # Backtest (optional)
+        if enable_backtest:
+            st.subheader("Backtest (single point)")
+            future_date = pd.to_datetime(prediction_date) + pd.tseries.offsets.BDay(FUTURE_DAYS)
+            try:
+                actual_df = get_stock_data(ticker, future_date.date())
+                actual_close = float(actual_df["Close"].iloc[-1])
+
+                err_lstm = abs(pred_price - actual_close)
+                err_adj = abs(adjusted_price - actual_close)
+
+                b1, b2, b3 = st.columns(3)
+                b1.metric(f"Actual Close on {future_date.date()}", f"${actual_close:,.2f}")
+                b2.metric("Abs Error (LSTM)", f"${err_lstm:,.2f}")
+                b3.metric("Abs Error (Adj)", f"${err_adj:,.2f}")
+            except Exception as e:
+                st.warning(f"Backtest failed (often due to missing future data): {e}")
+
+        st.caption(
+            "Notes: This is a prototype. Sentiment is computed from recent headlines and applied as a simple adjustment. "
+            "For a stronger approach, we would train on historical sentiment features aligned by date."
+        )
 
     except Exception as e:
-        st.error(f"Error making prediction: {str(e)}")
-        return None, None, None
+        st.error(str(e))
+        st.stop()
 
 
-
-        # Prepare the most recent sequence for prediction
-        latest_features = featured_data.iloc[-60:].copy()  # Last 60 days
-        scaled_features = scaler.transform(latest_features)
-        sequence = scaled_features.reshape(1, 60, -1)  # Reshape for LSTM
-        
-        # Make prediction
-        status_text.text("Making prediction...")
-        predicted_pct_change = model.predict(sequence, verbose=0)[0][0]
-        
-        progress_bar.progress(100)
-        status_text.text("Prediction complete!")
-        
-        return data, predicted_pct_change, latest_features
-        
-    except Exception as e:
-        st.error(f"Error making prediction: {str(e)}")
-        return None, None, None
-
-# Display results function
-def display_results(ticker, prediction_date, data, predicted_pct_change, latest_features, enable_backtest=False):
-    """Display the prediction results beautifully"""
-    
-    # For auto_adjust=True data, we get simple column names: ['Open', 'High', 'Low', 'Close', 'Volume']
-    close_col = 'Close'
-    
-    if close_col not in data.columns:
-        st.error(f"Could not find 'Close' column in the data. Available columns: {list(data.columns)}")
-        return
-    
-    latest_close = data[close_col].iloc[-1]
-    
-    # Calculate predicted price and confidence interval
-    error_std = 0.0305  # From your training results
-    confidence_interval = 1.96 * error_std
-    
-    predicted_price = latest_close * (1 + predicted_pct_change)
-    lower_bound = latest_close * (1 + predicted_pct_change - confidence_interval)
-    upper_bound = latest_close * (1 + predicted_pct_change + confidence_interval)
-    
-    # Display results
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.metric("Current Price", f"${latest_close:.2f}")
-    
-    with col2:
-        st.metric("Predicted Price (5 days)", f"${predicted_price:.2f}", 
-                 delta=f"{predicted_pct_change:.2%}")
-    
-    with col3:
-        st.metric("95% Confidence Range", 
-                 f"${lower_bound:.2f} - ${upper_bound:.2f}")
-    
-    if enable_backtest:
-        st.subheader("🔎 Backtesting Results")
-
-        try:
-            from utils.data_loader import get_stock_data
-            import pandas as pd
-
-            # Get actual price 5 trading days later
-            future_date = pd.to_datetime(prediction_date) + pd.tseries.offsets.BDay(5)
-            actual_data = get_stock_data(ticker, future_date.date())
-            actual_close = actual_data[close_col].iloc[-1]
-
-            mae = abs(predicted_price - actual_close)
-            pct_error = (mae / actual_close) * 100
-
-            st.write(f"**Actual closing price on {future_date.date()}:** ${actual_close:.2f}")
-            st.write(f"**Prediction Error:** ${mae:.2f} ({pct_error:.2f}%)")
-
-            if pct_error < 2:
-                st.success("✅ Prediction was very close!")
-            else:
-                st.warning("⚠️ Prediction deviated more than 2%.")
-
-        except Exception as e:
-            st.error(f"Backtesting failed: {e}") 
-    # Price chart
-    st.subheader("Price History")
-    fig, ax = plt.subplots(figsize=(12, 6))
-    
-    # Plot historical price (last 90 days for better visualization)
-    recent_data = data.iloc[-90:]
-    ax.plot(recent_data.index, recent_data[close_col], label='Historical Price', linewidth=2)
-    
-    # Add current and predicted price lines
-    ax.axhline(y=latest_close, color='r', linestyle='--', alpha=0.7, label='Current Price')
-    ax.axhline(y=predicted_price, color='g', linestyle='--', alpha=0.7, label='Predicted Price')
-    
-    # Add confidence interval area
-    last_date = data.index[-1]
-    future_dates = [last_date + timedelta(days=i) for i in range(1, 6)]
-    if len(future_dates) > 0:
-        ax.fill_between(future_dates, 
-                       [lower_bound] * len(future_dates), 
-                       [upper_bound] * len(future_dates), 
-                       color='orange', alpha=0.2, label='95% CI')
-    
-    ax.set_xlabel('Date')
-    ax.set_ylabel('Price ($)')
-    ax.set_title(f'{ticker} Price Prediction')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.xticks(rotation=45)
-    st.pyplot(fig)
-    
-    # Interpretation
-    st.subheader("Interpretation")
-    if predicted_pct_change > 0:
-        st.success(f"📈 Bullish Prediction: {ticker} is predicted to increase by {predicted_pct_change:.2%} over the next 5 trading days.")
-    else:
-        st.warning(f"📉 Bearish Prediction: {ticker} is predicted to decrease by {abs(predicted_pct_change):.2%} over the next 5 trading days.")
-    
-    st.info(f"**Confidence Level:** There's a 95% probability that the actual price will be between ${lower_bound:.2f} and ${upper_bound:.2f}.")
-    
-# Run the app
-if st.sidebar.button("Run Prediction"):
-    if not ticker:
-        st.error("Please enter a stock ticker symbol.")
-    else:
-        with st.spinner("Crunching numbers... This may take a minute"):
-            data, predicted_pct_change, latest_features = make_prediction(ticker, end_date)
-
-            if data is not None and predicted_pct_change is not None:
-                display_results(ticker, end_date, data, predicted_pct_change, latest_features, enable_backtest)
-
-# Footer
 st.sidebar.markdown("---")
 st.sidebar.info(
-    """
-    **How it works:**
-    - Uses LSTM neural network trained on 3 years of historical data
-    - Analyzes technical indicators (RSI, SMA, Bollinger Bands, etc.)
-    - Provides 5-day price predictions with confidence intervals
-    """
+    "Workflow:\n"
+    "1) Train: python train_model.py (or train_stock_model(...) )\n"
+    "2) Run app: streamlit run app.py\n"
+    "3) Forecast: loads saved artifacts per ticker\n"
 )
