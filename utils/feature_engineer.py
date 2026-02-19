@@ -1,137 +1,164 @@
 import pandas as pd
 import numpy as np
 
-def add_technical_indicators(df):
+
+def _standardize_ohlcv_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Adds technical indicators to the DataFrame as new columns.
-    This function manually calculates indicators for compatibility.
+    Returns a copy of df with standardized OHLCV columns:
+    ['Open', 'High', 'Low', 'Close', 'Volume']
 
-    Parameters:
-    df (pd.DataFrame): DataFrame with OHLCV data.
-
-    Returns:
-    pd.DataFrame: The original DataFrame with new technical indicator columns.
+    Handles MultiIndex columns and common variations.
     """
+    out = df.copy()
 
-    # Make a copy of the DataFrame to avoid modifying the original
-    df = df.copy()
+    # Flatten MultiIndex columns if present
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [c[0] for c in out.columns]
 
-    # Handle MultiIndex columns by flattening them first
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ['_'.join(col).strip('_') for col in df.columns]
-    
-    # Dynamically find the OHLCV columns
-    close_col = None
-    high_col = None
-    low_col = None
-    open_col = None
-    volume_col = None
-    
-    for col in df.columns:
-        col_lower = col.lower()
-        if 'close' in col_lower and 'adj' not in col_lower:
-            close_col = col
-        elif 'high' in col_lower:
-            high_col = col
-        elif 'low' in col_lower:
-            low_col = col
-        elif 'open' in col_lower:
-            open_col = col
-        elif 'volume' in col_lower:
-            volume_col = col
-    
-    # Use default names if not found
+    # Try to find columns by name (case-insensitive)
+    cols = {c.lower(): c for c in out.columns}
+
+    def find_col(keys):
+        for k in keys:
+            for col_lower, original in cols.items():
+                if k in col_lower:
+                    return original
+        return None
+
+    close_col = find_col(["close"])
+    open_col = find_col(["open"])
+    high_col = find_col(["high"])
+    low_col = find_col(["low"])
+    volume_col = find_col(["volume"])
+
+    # Basic validation
+    missing = []
     if close_col is None:
-        close_col = 'Close'
+        missing.append("Close")
     if high_col is None:
-        high_col = 'High'
+        missing.append("High")
     if low_col is None:
-        low_col = 'Low'
+        missing.append("Low")
     if open_col is None:
-        open_col = 'Open'
+        missing.append("Open")
     if volume_col is None:
-        volume_col = 'Volume'
+        missing.append("Volume")
 
-    # 1. Trend Indicators
-    # Simple Moving Averages
-    df['SMA_10'] = df[close_col].rolling(window=10).mean()
-    df['SMA_50'] = df[close_col].rolling(window=50).mean()
+    if missing:
+        raise ValueError(
+            f"Missing required OHLCV columns: {missing}. "
+            f"Available columns: {list(out.columns)}"
+        )
 
-    # 2. Momentum Indicators
-    # Relative Strength Index (RSI)
-    delta = df[close_col].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI_14'] = 100 - (100 / (1 + rs))
+    # Rename to standard
+    out = out.rename(
+        columns={
+            open_col: "Open",
+            high_col: "High",
+            low_col: "Low",
+            close_col: "Close",
+            volume_col: "Volume",
+        }
+    )
 
-    # 3. Volatility Indicators
-    # Bollinger Bands
-    sma_20 = df[close_col].rolling(window=20).mean()
-    std_20 = df[close_col].rolling(window=20).std()
-    bb_upper = sma_20 + (std_20 * 2)
-    bb_lower = sma_20 - (std_20 * 2)
-    df['BB_Upper'] = bb_upper
-    df['BB_Lower'] = bb_lower
-    df['BBP_20'] = (df[close_col] - bb_lower) / (bb_upper - bb_lower)  # %B
+    # Ensure datetime index sorted
+    out.index = pd.to_datetime(out.index)
+    out = out.sort_index()
 
-    # Average True Range (ATR)
-    high_low = df[high_col] - df[low_col]
-    high_close = np.abs(df[high_col] - df[close_col].shift())
-    low_close = np.abs(df[low_col] - df[close_col].shift())
-    ranges = pd.concat([high_low, high_close, low_close], axis=1)
-    true_range = ranges.max(axis=1)
-    df['ATR_14'] = true_range.rolling(window=14).mean()
+    return out
 
-    # 4. Volume-based Indicator
-    # On-Balance Volume (OBV)
-    df['OBV'] = (np.sign(df[close_col].diff()) * df[volume_col]).fillna(0).cumsum()
 
-    # 5. Create a simple price-based feature: Daily Return
-    df['Daily_Return'] = df[close_col].pct_change()
+def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds a simplified, core set of technical indicators.
 
-    # After adding many indicators, the first ~50 rows will be NaN (due to calculation windows)
-    # Drop all rows with any NaN values to have a clean dataset for the model
-    df.dropna(inplace=True)
+    Output columns (stable order):
+      Open, High, Low, Close, Volume,
+      Return_1D,
+      SMA_10, SMA_30,
+      EMA_10,
+      RSI_14,
+      BBP_20,
+      ATR_14,
+      Vol_Change,
+      Range_Pct
 
-    # Ensure we have exactly the expected columns in the right order
-    expected_columns = [
-        close_col, high_col, low_col, open_col, volume_col,
-        'SMA_10', 'SMA_50', 'RSI_14', 'BB_Upper', 'BB_Lower', 
-        'BBP_20', 'ATR_14', 'OBV', 'Daily_Return'
+    Drops rows with NaNs caused by rolling windows.
+    """
+    d = _standardize_ohlcv_columns(df)
+
+    close = d["Close"]
+    high = d["High"]
+    low = d["Low"]
+    volume = d["Volume"]
+
+    # 1) Simple returns
+    d["Return_1D"] = close.pct_change()
+
+    # 2) Trend
+    d["SMA_10"] = close.rolling(window=10).mean()
+    d["SMA_30"] = close.rolling(window=30).mean()
+    d["EMA_10"] = close.ewm(span=10, adjust=False).mean()
+
+    # 3) RSI (14)
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=14).mean()
+    avg_loss = loss.rolling(window=14).mean()
+    rs = avg_gain / (avg_loss.replace(0, np.nan))
+    d["RSI_14"] = 100 - (100 / (1 + rs))
+
+    # 4) Bollinger %B (20)
+    sma_20 = close.rolling(window=20).mean()
+    std_20 = close.rolling(window=20).std()
+    bb_upper = sma_20 + 2 * std_20
+    bb_lower = sma_20 - 2 * std_20
+    d["BBP_20"] = (close - bb_lower) / (bb_upper - bb_lower)
+
+    # 5) ATR (14)
+    high_low = high - low
+    high_close = (high - close.shift()).abs()
+    low_close = (low - close.shift()).abs()
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    d["ATR_14"] = true_range.rolling(window=14).mean()
+
+    # 6) Volume change
+    d["Vol_Change"] = volume.pct_change()
+
+    # 7) Daily range as % of close
+    d["Range_Pct"] = (high - low) / close
+
+    # Keep stable column order
+    final_cols = [
+        "Open", "High", "Low", "Close", "Volume",
+        "Return_1D",
+        "SMA_10", "SMA_30",
+        "EMA_10",
+        "RSI_14",
+        "BBP_20",
+        "ATR_14",
+        "Vol_Change",
+        "Range_Pct",
     ]
-    
-    # Keep only the expected columns (in case some were missing)
-    df = df[expected_columns]
-    
-    # Rename the OHLCV columns to standard names for consistency
-    df = df.rename(columns={
-        close_col: 'Close',
-        high_col: 'High', 
-        low_col: 'Low',
-        open_col: 'Open',
-        volume_col: 'Volume'
-    })
+    d = d[final_cols]
 
-    return df
+    # Drop NaNs from rolling calculations
+    d = d.dropna()
 
-# Example usage for testing:
+    # A small safety check (helps catch weird downloads)
+    if len(d) < 100:
+        raise ValueError(f"Not enough rows after indicator generation: {len(d)} rows remain.")
+
+    return d
+
+
 if __name__ == "__main__":
-    # This block only runs if you run this file directly, not when imported
-    from data_loader import get_stock_data
+    from utils.data_loader import get_stock_data
 
-    # Get some sample data
-    test_date = pd.to_datetime('2023-12-01').date()
-    sample_data = get_stock_data('AAPL', test_date)
-    print(f"Original data shape: {sample_data.shape}")
-    print(f"Original columns: {sample_data.columns.tolist()}")
-
-    # Add technical indicators
-    featured_data = add_technical_indicators(sample_data)
-
-    # Inspect the results
-    print(f"New data shape after adding features: {featured_data.shape}")
-    print("\nFirst 3 rows of the new technical indicator columns:")
-    # Show only the first 3 rows of the new indicator columns (not the original OHLCV)
-    new_columns = [col for col in featured_data.columns if col not in sample_data.columns]
-    print(featured_data[new_columns].head(3))
+    test_date = pd.to_datetime("2023-12-01").date()
+    raw = get_stock_data("AAPL", test_date)
+    feats = add_technical_indicators(raw)
+    print("Feature engineering OK.")
+    print(feats.tail())
+    print("Columns:", feats.columns.tolist())
