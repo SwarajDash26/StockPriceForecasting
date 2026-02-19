@@ -1,207 +1,224 @@
-import pandas as pd
+import os
+import json
 import numpy as np
+import pandas as pd
+import joblib
+import matplotlib.pyplot as plt
+
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
 from utils.data_loader import get_stock_data
 from utils.feature_engineer import add_technical_indicators
 from utils.preprocess import create_target, prepare_data_for_lstm
 from utils.model_builder import create_lstm_model
-from tensorflow.keras.callbacks import EarlyStopping
-import matplotlib.pyplot as plt
-import joblib
 
-def calculate_confidence_interval(model, X_train, y_train, X_test, y_test):
-    """
-    Calculates prediction intervals for regression results.
-    """
-    # Make predictions
-    train_predictions = model.predict(X_train, verbose=0).flatten()
-    test_predictions = model.predict(X_test, verbose=0).flatten()
-    
-    # Calculate errors
-    train_errors = y_train - train_predictions
-    test_errors = y_test - test_predictions
-    
-    # Calculate standard deviation of errors (this will be our uncertainty measure)
-    error_std = np.std(test_errors)
-    
-    print(f"   Error Standard Deviation: {error_std:.4f}")
-    print(f"   95% Confidence Interval: ±{1.96 * error_std:.4f}")
-    
-    return error_std, test_predictions, test_errors, train_predictions, train_errors
 
-def plot_predictions_vs_actual(y_true, y_pred, error_std, ticker):
+def _ensure_models_dir():
+    os.makedirs("models", exist_ok=True)
+
+
+def compute_error_std(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """
-    Creates a comprehensive visualization of prediction performance.
+    Compute std dev of residuals on a holdout set.
+    Used as a simple uncertainty proxy for a demo deliverable.
     """
-    plt.figure(figsize=(15, 10))
-    
-    # 1. Scatter plot: Predicted vs Actual
-    plt.subplot(2, 2, 1)
-    plt.scatter(y_true, y_pred, alpha=0.6)
-    plt.plot([min(y_true), max(y_true)], [min(y_true), max(y_true)], 'r--', lw=2)
-    plt.xlabel('Actual Percentage Change')
-    plt.ylabel('Predicted Percentage Change')
-    plt.title(f'{ticker} - Predicted vs Actual\n(Perfect prediction = red line)')
-    plt.grid(True, alpha=0.3)
-    
-    # 2. Error distribution histogram
-    plt.subplot(2, 2, 2)
-    errors = y_true - y_pred
-    plt.hist(errors, bins=30, alpha=0.7, edgecolor='black')
-    plt.axvline(x=0, color='r', linestyle='--', label='Zero Error')
-    plt.axvline(x=error_std, color='orange', linestyle='--', label=f'+1 STD ({error_std:.3f})')
-    plt.axvline(x=-error_std, color='orange', linestyle='--', label=f'-1 STD ({error_std:.3f})')
-    plt.xlabel('Prediction Error (Actual - Predicted)')
-    plt.ylabel('Frequency')
-    plt.title('Error Distribution')
+    residuals = (y_true - y_pred).astype(float)
+    return float(np.std(residuals))
+
+
+def save_json(path: str, payload: dict):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
+def plot_training_history(history, ticker: str, save_path: str):
+    plt.figure(figsize=(12, 5))
+
+    # MAE
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history.get("mae", []), label="train_mae")
+    plt.plot(history.history.get("val_mae", []), label="val_mae")
+    plt.title(f"{ticker} - MAE")
+    plt.xlabel("epoch")
+    plt.ylabel("MAE")
     plt.legend()
-    plt.grid(True, alpha=0.3)
-    
-    # 3. Time series of predictions with confidence intervals
-    plt.subplot(2, 1, 2)
-    plt.plot(y_true, 'b-', label='Actual', alpha=0.7)
-    plt.plot(y_pred, 'r-', label='Predicted', alpha=0.7)
-    # Add confidence interval band
-    plt.fill_between(range(len(y_pred)), 
-                    y_pred - 1.96*error_std, 
-                    y_pred + 1.96*error_std, 
-                    color='orange', alpha=0.2, label='95% Confidence Interval')
-    plt.xlabel('Test Sample Index')
-    plt.ylabel('Percentage Change')
-    plt.title('Time Series: Actual vs Predicted with Confidence Intervals')
+
+    # Loss
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history.get("loss", []), label="train_loss")
+    plt.plot(history.history.get("val_loss", []), label="val_loss")
+    plt.title(f"{ticker} - Loss (MSE)")
+    plt.xlabel("epoch")
+    plt.ylabel("MSE")
     plt.legend()
-    plt.grid(True, alpha=0.3)
-    
+
     plt.tight_layout()
-    plt.savefig(f'models/{ticker}_predictions_analysis.png')
-    plt.show()
-    
-    # Print some statistics
-    print("\nPrediction Analysis:")
-    print(f"Correlation coefficient: {np.corrcoef(y_true, y_pred)[0,1]:.3f}")
-    print(f"Percentage within 95% CI: {np.mean((y_true >= y_pred - 1.96*error_std) & (y_true <= y_pred + 1.96*error_std)) * 100:.1f}%")
-    print(f"Max overprediction: {np.max(errors):.3f}")
-    print(f"Max underprediction: {np.min(errors):.3f}")
-    
-def train_stock_model(ticker=None, prediction_date=None, future_days=5, n_steps=60):
-    if ticker is None:
-        raise ValueError("Please provide a ticker (e.g., MSFT, NVDA)")
+    plt.savefig(save_path, dpi=160)
+    plt.close()
+
+
+def plot_pred_vs_actual(y_true: np.ndarray, y_pred: np.ndarray, ticker: str, save_path: str):
+    plt.figure(figsize=(6, 6))
+    plt.scatter(y_true, y_pred, alpha=0.5)
+    mn = float(min(y_true.min(), y_pred.min()))
+    mx = float(max(y_true.max(), y_pred.max()))
+    plt.plot([mn, mx], [mn, mx], "r--", linewidth=2)
+    plt.title(f"{ticker} - Predicted vs Actual (Return)")
+    plt.xlabel("Actual")
+    plt.ylabel("Predicted")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=160)
+    plt.close()
+
+
+def train_stock_model(
+    ticker: str,
+    prediction_date=None,
+    future_days: int = 5,
+    n_steps: int = 60,
+    test_size: float = 0.2,
+    epochs: int = 30,
+    batch_size: int = 32,
+    learning_rate: float = 1e-3,
+    verbose: int = 1,
+):
     """
-    Complete training pipeline for the stock prediction model.
+    End-to-end training pipeline:
+      data -> indicators -> target -> sequences -> train -> evaluate -> save artifacts
+
+    Returns:
+      model, metrics_dict
     """
-    # Use current date if none provided
+    if not ticker:
+        raise ValueError("ticker is required (e.g., 'AAPL').")
+
+    _ensure_models_dir()
+
     if prediction_date is None:
-        prediction_date = pd.to_datetime('today').date()
+        prediction_date = pd.to_datetime("today").date()
     else:
         prediction_date = pd.to_datetime(prediction_date).date()
-    
-    print(f"Training model for {ticker} predicting {future_days} days from {prediction_date}")
-    print("=" * 60)
-    
-    # Step 1: Load data
-    print("1. Loading data...")
-    data = get_stock_data(ticker, prediction_date)
-    print(f"   Raw data shape: {data.shape}")
-    
-    # Step 2: Feature engineering
-    print("2. Engineering features...")
-    featured_data = add_technical_indicators(data)
-    print(f"   Featured data shape: {featured_data.shape}")
-    
-    # Step 3: Create target and prepare for LSTM
-    print("3. Creating target and preparing sequences...")
-    data_with_target = create_target(featured_data, future_days=future_days)
-    print(f"   Data with target shape: {data_with_target.shape}")
-    print(f"   Target distribution: {data_with_target['Target'].value_counts().to_dict()}")
-    
-    X_train, X_test, y_train, y_test, scaler = prepare_data_for_lstm(
-        data_with_target, n_steps=n_steps, test_size=0.2
+
+    print(f"\nTraining {ticker} | predict {future_days}-day return | cutoff={prediction_date}")
+    print("=" * 72)
+
+    # 1) Load data
+    print("1) Loading data...")
+    raw = get_stock_data(ticker, prediction_date)
+    print(f"   Raw rows: {len(raw)} | cols: {list(raw.columns)}")
+
+    # 2) Features (technical indicators)
+    print("2) Engineering features...")
+    feats = add_technical_indicators(raw)
+    print(f"   Feature rows after indicators: {len(feats)} | feature cols: {list(feats.columns)}")
+
+    # 3) Target
+    print("3) Creating target...")
+    df = create_target(feats, future_days=future_days)
+    print(f"   Rows after target drop: {len(df)}")
+
+    # 4) Sequences + leakage-free scaling
+    print("4) Preparing sequences...")
+    X_train, X_test, y_train, y_test, scaler, feature_columns = prepare_data_for_lstm(
+        df, n_steps=n_steps, test_size=test_size
     )
-    
-    # Step 4: Create and train model
-    print("4. Building and training model...")
-    input_shape = (X_train.shape[1], X_train.shape[2])  # (timesteps, features)
-    model = create_lstm_model(input_shape)
-    
-    # Use early stopping to prevent overfitting
-    early_stopping = EarlyStopping(
-        monitor='val_loss',
-        patience=10,
+
+    # 5) Model
+    print("5) Building model...")
+    input_shape = (X_train.shape[1], X_train.shape[2])
+    model = create_lstm_model(input_shape, learning_rate=learning_rate, show_summary=True)
+
+    early = EarlyStopping(
+        monitor="val_loss",
+        patience=8,
         restore_best_weights=True,
-        verbose=1
+        verbose=1,
     )
-    
-    # Train the model
+    reduce_lr = ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.5,
+        patience=4,
+        min_lr=1e-5,
+        verbose=1,
+    )
+
+    print("6) Training...")
     history = model.fit(
-        X_train, y_train,
+        X_train,
+        y_train,
         validation_data=(X_test, y_test),
-        epochs=50,
-        batch_size=32,
-        callbacks=[early_stopping],
-        verbose=1
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=[early, reduce_lr],
+        verbose=verbose,
     )
-    
-    # Step 5: Evaluate the model
-    print("5. Evaluating model...")
-    print("5. Evaluating model and calculating confidence intervals...")
+
+    print("7) Evaluating...")
     train_loss, train_mae, train_mse = model.evaluate(X_train, y_train, verbose=0)
     test_loss, test_mae, test_mse = model.evaluate(X_test, y_test, verbose=0)
-    
-    error_std, test_predictions, test_errors, train_predictions, train_errors = calculate_confidence_interval(
-        model, X_train, y_train, X_test, y_test
-    )
-    
-    # Plot comprehensive predictions analysis
-    plot_predictions_vs_actual(y_test, test_predictions, error_std, ticker)
-    
-    print(f"   Training MAE: {train_mae:.4f}")
-    print(f"   Test MAE: {test_mae:.4f}")
-    print(f"   Test MSE: {test_mse:.4f}")
-    # Step 6: Save the model and scaler
-    print("6. Saving model and artifacts...")
-    model.save(f'models/{ticker}_lstm_model.keras')
-    joblib.dump(scaler, f'models/{ticker}_scaler.pkl')
-    
-    print(f"   Model saved as: models/{ticker}_lstm_model.keras")
-    print(f"   Scaler saved as: models/{ticker}_scaler.pkl")
-    
-    # Plot training history
-    plt.figure(figsize=(12, 6))
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(history.history['mae'], label='Training MAE')
-    plt.plot(history.history['val_mae'], label='Validation MAE')
-    plt.title('Model Mean Absolute Error')
-    plt.xlabel('Epoch')
-    plt.ylabel('MAE')
-    plt.legend()
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(history.history['loss'], label='Training Loss')
-    plt.plot(history.history['val_loss'], label='Validation Loss')
-    plt.title('Model Loss (MSE)')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.savefig(f'models/{ticker}_training_history.png')
-    plt.show()
-    
-    return model, history, test_mae  # Return test_mae instead of test_accuracy
+
+    y_pred_test = model.predict(X_test, verbose=0).flatten().astype(float)
+    error_std = compute_error_std(y_test, y_pred_test)
+    ci95 = 1.96 * error_std
+
+    metrics = {
+        "ticker": ticker,
+        "prediction_date": str(prediction_date),
+        "future_days": int(future_days),
+        "n_steps": int(n_steps),
+        "test_size": float(test_size),
+        "train_mae": float(train_mae),
+        "test_mae": float(test_mae),
+        "test_mse": float(test_mse),
+        "error_std": float(error_std),
+        "ci95": float(ci95),
+        "num_train_sequences": int(len(X_train)),
+        "num_test_sequences": int(len(X_test)),
+        "feature_columns": feature_columns,
+    }
+
+    print(f"   Train MAE: {train_mae:.5f}")
+    print(f"   Test  MAE: {test_mae:.5f}")
+    print(f"   Test  MSE: {test_mse:.5f}")
+    print(f"   Residual STD (test): {error_std:.5f} | 95% CI: ±{ci95:.5f}")
+
+    # 8) Save artifacts
+    print("8) Saving artifacts...")
+    model_path = f"models/{ticker}_lstm_model.keras"
+    scaler_path = f"models/{ticker}_scaler.pkl"
+    cols_path = f"models/{ticker}_feature_columns.json"
+    meta_path = f"models/{ticker}_error_std.json"
+    hist_path = f"models/{ticker}_training_history.png"
+    scatter_path = f"models/{ticker}_pred_vs_actual.png"
+
+    model.save(model_path)
+    joblib.dump(scaler, scaler_path)
+    save_json(cols_path, {"feature_columns": feature_columns})
+    save_json(meta_path, {"error_std": error_std, "ci95": ci95})
+
+    plot_training_history(history, ticker, hist_path)
+    plot_pred_vs_actual(y_test, y_pred_test, ticker, scatter_path)
+
+    print(f"   Saved model:   {model_path}")
+    print(f"   Saved scaler:  {scaler_path}")
+    print(f"   Saved cols:    {cols_path}")
+    print(f"   Saved meta:    {meta_path}")
+    print(f"   Saved plots:   {hist_path}, {scatter_path}")
+
+    return model, metrics
 
 
 if __name__ == "__main__":
-    # Install required package if not already installed
-    # pip install joblib matplotlib
-    
-    # Train the model
-    model, history, test_mae = train_stock_model(
-        ticker='AAPL',
-        prediction_date='2023-12-01',
+    # Fast-ish default run (edit ticker/date as needed)
+    train_stock_model(
+        ticker="AAPL",
+        prediction_date="2023-12-01",
         future_days=5,
-        n_steps=60
+        n_steps=60,
+        test_size=0.2,
+        epochs=15,
+        batch_size=32,
+        learning_rate=1e-3,
+        verbose=1,
     )
-    
-    print(f"\nTraining completed! Final Test MAE: {test_mae:.4f}")
-    
-    
