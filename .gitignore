@@ -1,11 +1,15 @@
-# Model artifacts / plots
-models/*.keras
-models/*.pkl
-models/*.png
-models/*.json
-
 # Python
 __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Model artifacts / outputs
+models/*.keras
+models/*.pkl
+models/*.png
+models/*.json
+
+# OS / IDE
+.DS_Store
+.vscode/
