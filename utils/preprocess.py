@@ -1,134 +1,136 @@
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
 
-def create_target(df, future_days=5):
+
+def create_target(df: pd.DataFrame, future_days: int = 5) -> pd.DataFrame:
     """
-    Creates the target variable for our REGRESSION problem.
-    We predict the percentage change in 'future_days' days.
+    Creates the regression target:
+    Target = (Close[t+future_days] - Close[t]) / Close[t]
 
-    Parameters:
-    df (pd.DataFrame): DataFrame with technical indicators.
-    future_days (int): Number of days ahead to predict.
-
-    Returns:
-    pd.DataFrame: DataFrame with the new 'Target' column (percentage change).
+    Notes:
+    - Assumes a 'Close' column exists (your feature_engineer standardizes to this).
+    - Drops the last `future_days` rows (no future price available).
     """
     df = df.copy()
-    
-    # First, let's simplify the MultiIndex columns to single-level columns
+
+    # Handle MultiIndex columns just in case
     if isinstance(df.columns, pd.MultiIndex):
-        # Flatten the MultiIndex columns
-        df.columns = ['_'.join(col).strip('_') for col in df.columns]
-    
-    # Dynamically find the close column
-    close_col = None
-    for col in df.columns:
-        if 'close' in col.lower() and 'adj' not in col.lower():
-            close_col = col
-            break
-    
-    if close_col is None:
-        # If no close column found, try any column with 'close'
+        df.columns = ["_".join(col).strip("_") for col in df.columns]
+
+    if "Close" not in df.columns:
+        # Fallback: try to find a close-like column
+        close_col = None
         for col in df.columns:
-            if 'close' in col.lower():
+            c = col.lower()
+            if "close" in c and "adj" not in c:
                 close_col = col
                 break
-    
-    if close_col is None:
-        raise ValueError("Could not find a close price column in the DataFrame")
-    
-    # Calculate future price: shift the close price backward by 'future_days'
-    future_price = df[close_col].shift(-future_days)
-    
-    # Calculate PERCENTAGE CHANGE from current to future price (REGRESSION TARGET)
-    df['Target'] = (future_price - df[close_col]) / df[close_col]
-    
-    # Drop the last 'future_days' rows which will have NaN for the target
-    df = df.dropna(subset=['Target'])
-    
-    return df
-    
-def prepare_data_for_lstm(df, n_steps=60, test_size=0.2):
-    """
-    Prepares the data for LSTM training by scaling and creating sequences.
+        if close_col is None:
+            raise ValueError("Could not find a 'Close' column in the DataFrame.")
+        df = df.rename(columns={close_col: "Close"})
 
-    Parameters:
-    df (pd.DataFrame): DataFrame with features and target.
-    n_steps (int): Number of past days to use for prediction (sequence length).
-    test_size (float): Proportion of data to use for testing.
+    future_close = df["Close"].shift(-future_days)
+    df["Target"] = (future_close - df["Close"]) / df["Close"]
+
+    # Drop rows where target is NaN (last future_days)
+    df = df.dropna(subset=["Target"])
+    return df
+
+
+def prepare_data_for_lstm(
+    df: pd.DataFrame,
+    n_steps: int = 60,
+    test_size: float = 0.2,
+):
+    """
+    Prepares data for LSTM training:
+    - Uses numeric columns except 'Target' as features
+    - Chronological split (no shuffling)
+    - Fits scaler ONLY on training feature rows (prevents leakage)
+    - Builds sequences of length n_steps
 
     Returns:
-    tuple: X_train, X_test, y_train, y_test, feature_scaler
+      X_train, X_test, y_train, y_test, feature_scaler, feature_columns
     """
-    # Separate features and target
-    # Make sure we only keep numeric columns for features
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if 'Target' in numeric_cols:
-        numeric_cols.remove('Target')
-    
-    features = df[numeric_cols]
-    target = df['Target']
-    
-    # 1. Scale the features
-    feature_scaler = MinMaxScaler()
-    scaled_features = feature_scaler.fit_transform(features)
-    
-    # 2. Create sequences for LSTM
-    X, y = [], []
-    for i in range(n_steps, len(scaled_features)):
-        # Get sequence of n_steps days
-        X.append(scaled_features[i-n_steps:i])
-        # Get target for the current day (which corresponds to future prediction)
-        y.append(target.iloc[i])
-    
-    X = np.array(X)
-    y = np.array(y)
-    
-    # 3. Split into train and test sets CHRONOLOGICALLY
-    split_index = int(len(X) * (1 - test_size))
-    
-    X_train = X[:split_index]
-    X_test = X[split_index:]
-    y_train = y[:split_index]
-    y_test = y[split_index:]
-    
-    print(f"X_train shape: {X_train.shape}")
-    print(f"X_test shape: {X_test.shape}")
-    print(f"y_train shape: {y_train.shape}")
-    print(f"y_test shape: {y_test.shape}")
-    
-    return X_train, X_test, y_train, y_test, feature_scaler
+    if "Target" not in df.columns:
+        raise ValueError("DataFrame must contain a 'Target' column. Call create_target(...) first.")
 
-# Let's add some debug information to see what's happening
+    if not (0.0 < test_size < 1.0):
+        raise ValueError("test_size must be between 0 and 1.")
+
+    df = df.copy()
+
+    # Features: numeric columns except Target
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if "Target" in numeric_cols:
+        numeric_cols.remove("Target")
+
+    if len(numeric_cols) == 0:
+        raise ValueError("No numeric feature columns found.")
+
+    feature_columns = numeric_cols
+    features = df[feature_columns]
+    target = df["Target"].astype(float)
+
+    if len(df) <= n_steps + 5:
+        raise ValueError(f"Not enough rows ({len(df)}) to create sequences with n_steps={n_steps}.")
+
+    # Chronological split point in ROW space (not sequence space)
+    split_row = int(len(df) * (1 - test_size))
+
+    # We need split_row > n_steps so there is at least one training sequence
+    if split_row <= n_steps:
+        raise ValueError(
+            f"Split produces no training sequences. "
+            f"len(df)={len(df)}, n_steps={n_steps}, split_row={split_row}. "
+            f"Reduce n_steps or reduce test_size."
+        )
+
+    # Fit scaler on training portion ONLY (prevents leakage)
+    feature_scaler = MinMaxScaler()
+    feature_scaler.fit(features.iloc[:split_row])
+
+    scaled_features = feature_scaler.transform(features)
+
+    # Build sequences
+    X, y = [], []
+    # i is the "current" row index (sequence ends at i-1, predicts target at i)
+    for i in range(n_steps, len(scaled_features)):
+        X.append(scaled_features[i - n_steps : i])
+        y.append(target.iloc[i])
+
+    X = np.asarray(X, dtype=np.float32)
+    y = np.asarray(y, dtype=np.float32)
+
+    # Convert split from row space to sequence space:
+    # sequence index j corresponds to row i = n_steps + j
+    train_seq_count = split_row - n_steps
+
+    X_train = X[:train_seq_count]
+    y_train = y[:train_seq_count]
+    X_test = X[train_seq_count:]
+    y_test = y[train_seq_count:]
+
+    print(f"Feature columns ({len(feature_columns)}): {feature_columns}")
+    print(f"Split row: {split_row} of {len(df)} rows")
+    print(f"X_train shape: {X_train.shape} | y_train shape: {y_train.shape}")
+    print(f"X_test shape:  {X_test.shape} | y_test shape:  {y_test.shape}")
+
+    return X_train, X_test, y_train, y_test, feature_scaler, feature_columns
+
+
 if __name__ == "__main__":
-    from data_loader import get_stock_data
-    from feature_engineer import add_technical_indicators
-    
-    # Get and prepare the data
-    test_date = pd.to_datetime('2023-12-01').date()
-    data = get_stock_data('AAPL', test_date)
-    print(f"Raw data shape: {data.shape}")
-    
-    featured_data = add_technical_indicators(data)
-    print(f"Featured data shape: {featured_data.shape}")
-    print(f"Featured data columns: {featured_data.columns.tolist()}")
-    
-    # Create target variable
-    data_with_target = create_target(featured_data, future_days=5)
-    print(f"Data shape after adding target: {data_with_target.shape}")
-    
-    if 'Target' in data_with_target.columns:
-        print(f"Target value counts:\n{data_with_target['Target'].value_counts()}")
-        print(f"Target NaN values: {data_with_target['Target'].isna().sum()}")
-    else:
-        print("Target column was not created successfully")
-        print(f"Available columns: {data_with_target.columns.tolist()}")
-    
-    # Prepare for LSTM only if target was created
-    if 'Target' in data_with_target.columns:
-        X_train, X_test, y_train, y_test, scaler = prepare_data_for_lstm(data_with_target)
-        print("\nData preparation completed successfully!")
-        print(f"Number of training sequences: {len(X_train)}")
-        print(f"Number of testing sequences: {len(X_test)}")
+    # Quick self-test (optional)
+    from utils.data_loader import get_stock_data
+    from utils.feature_engineer import add_technical_indicators
+
+    test_date = pd.to_datetime("2023-12-01").date()
+    raw = get_stock_data("AAPL", test_date)
+    feats = add_technical_indicators(raw)
+    with_target = create_target(feats, future_days=5)
+
+    X_train, X_test, y_train, y_test, scaler, cols = prepare_data_for_lstm(
+        with_target, n_steps=60, test_size=0.2
+    )
+    print("Preprocess OK.")
