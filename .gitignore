@@ -1,0 +1,11 @@
+# Model artifacts / plots
+models/*.keras
+models/*.pkl
+models/*.png
+models/*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
