@@ -1,0 +1,21 @@
+{
+  "feature_columns": [
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume",
+    "Return_1D",
+    "SMA_10",
+    "SMA_30",
+    "EMA_10",
+    "RSI_14",
+    "BBP_20",
+    "ATR_14",
+    "Vol_Change",
+    "Range_Pct",
+    "Sentiment_MeanCompound",
+    "Sentiment_HeadlineCount",
+    "Sentiment_Vote"
+  ]
+}

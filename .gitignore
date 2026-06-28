@@ -4,11 +4,12 @@ __pycache__/
 .venv/
 venv/
 
-# Model artifacts / outputs
-models/*.keras
-models/*.pkl
-models/*.png
-models/*.json
+# Runtime model artifacts are deployed with the app; generated charts stay local.
+models/*
+!models/*_lstm_model.keras
+!models/*_scaler.pkl
+!models/*_feature_columns.json
+!models/*_error_std.json
 
 # OS / IDE
 .DS_Store

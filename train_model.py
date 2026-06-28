@@ -11,6 +11,7 @@ from utils.data_loader import get_stock_data
 from utils.feature_engineer import add_technical_indicators
 from utils.preprocess import create_target, prepare_data_for_lstm
 from utils.model_builder import create_lstm_model
+from utils.sentiment import build_daily_sentiment_features
 
 
 def _ensure_models_dir():
@@ -20,7 +21,7 @@ def _ensure_models_dir():
 def compute_error_std(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """
     Compute std dev of residuals on a holdout set.
-    Used as a simple uncertainty proxy for a demo deliverable.
+    Used as a simple uncertainty proxy.
     """
     residuals = (y_true - y_pred).astype(float)
     return float(np.std(residuals))
@@ -85,7 +86,7 @@ def train_stock_model(
 ):
     """
     End-to-end training pipeline:
-      data -> indicators -> target -> sequences -> train -> evaluate -> save artifacts
+      data -> indicators -> sentiment features -> target -> sequences -> train -> evaluate -> save artifacts
 
     Returns:
       model, metrics_dict
@@ -108,10 +109,30 @@ def train_stock_model(
     raw = get_stock_data(ticker, prediction_date)
     print(f"   Raw rows: {len(raw)} | cols: {list(raw.columns)}")
 
-    # 2) Features (technical indicators)
-    print("2) Engineering features...")
+    # 2) Technical features
+    print("2) Engineering technical features...")
     feats = add_technical_indicators(raw)
-    print(f"   Feature rows after indicators: {len(feats)} | feature cols: {list(feats.columns)}")
+    print(f"   Rows after indicators: {len(feats)} | feature cols: {list(feats.columns)}")
+
+    # 2.1) Sentiment features aligned by date
+    print("2.1) Building sentiment features...")
+    sent_daily, scored_headlines = build_daily_sentiment_features(
+        ticker=ticker,
+        market_index=feats.index,
+        max_days_back_news_pull=120,
+        company_name=None,
+    )
+
+    feats = feats.join(sent_daily, how="left")
+    feats["Sentiment_MeanCompound"] = feats["Sentiment_MeanCompound"].fillna(0.0)
+    feats["Sentiment_HeadlineCount"] = feats["Sentiment_HeadlineCount"].fillna(0.0)
+    feats["Sentiment_Vote"] = feats["Sentiment_Vote"].fillna(0.0)
+
+    print(
+        "   Added sentiment columns: "
+        "Sentiment_MeanCompound, Sentiment_HeadlineCount, Sentiment_Vote"
+    )
+    print(f"   Headlines fetched/scored: {len(scored_headlines)}")
 
     # 3) Target
     print("3) Creating target...")
@@ -176,6 +197,7 @@ def train_stock_model(
         "num_train_sequences": int(len(X_train)),
         "num_test_sequences": int(len(X_test)),
         "feature_columns": feature_columns,
+        "num_headlines_used_source": int(len(scored_headlines)),
     }
 
     print(f"   Train MAE: {train_mae:.5f}")
@@ -210,7 +232,7 @@ def train_stock_model(
 
 
 if __name__ == "__main__":
-    # Fast-ish default run (edit ticker/date as needed)
+    # Default test run
     train_stock_model(
         ticker="AAPL",
         prediction_date="2023-12-01",
