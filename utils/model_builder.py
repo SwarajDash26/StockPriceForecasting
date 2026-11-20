@@ -23,14 +23,12 @@ def create_lstm_model(input_shape, learning_rate: float = 1e-3, show_summary: bo
     """
     model = Sequential()
 
-    # Compact stacked LSTM (enough for daily data)
     model.add(LSTM(64, return_sequences=True, input_shape=input_shape))
     model.add(Dropout(0.2))
 
     model.add(LSTM(32, return_sequences=False))
     model.add(Dropout(0.2))
 
-    # Small dense head
     model.add(Dense(16, activation="relu"))
     model.add(Dense(1, activation="linear"))
 
@@ -48,6 +46,5 @@ def create_lstm_model(input_shape, learning_rate: float = 1e-3, show_summary: bo
 
 
 if __name__ == "__main__":
-    # Quick self-test
     m = create_lstm_model((60, 14), show_summary=True)
     print("Model build OK.")

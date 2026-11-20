@@ -92,15 +92,12 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     low = d["Low"]
     volume = d["Volume"]
 
-    # 1) Simple returns
     d["Return_1D"] = close.pct_change()
 
-    # 2) Trend
     d["SMA_10"] = close.rolling(window=10).mean()
     d["SMA_30"] = close.rolling(window=30).mean()
     d["EMA_10"] = close.ewm(span=10, adjust=False).mean()
 
-    # 3) RSI (14)
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -109,27 +106,22 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     rs = avg_gain / (avg_loss.replace(0, np.nan))
     d["RSI_14"] = 100 - (100 / (1 + rs))
 
-    # 4) Bollinger %B (20)
     sma_20 = close.rolling(window=20).mean()
     std_20 = close.rolling(window=20).std()
     bb_upper = sma_20 + 2 * std_20
     bb_lower = sma_20 - 2 * std_20
     d["BBP_20"] = (close - bb_lower) / (bb_upper - bb_lower)
 
-    # 5) ATR (14)
     high_low = high - low
     high_close = (high - close.shift()).abs()
     low_close = (low - close.shift()).abs()
     true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     d["ATR_14"] = true_range.rolling(window=14).mean()
 
-    # 6) Volume change
     d["Vol_Change"] = volume.pct_change()
 
-    # 7) Daily range as % of close
     d["Range_Pct"] = (high - low) / close
 
-    # Keep stable column order
     final_cols = [
         "Open", "High", "Low", "Close", "Volume",
         "Return_1D",
@@ -143,10 +135,8 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ]
     d = d[final_cols]
 
-    # Drop NaNs from rolling calculations
     d = d.dropna()
 
-    # A small safety check (helps catch weird downloads)
     if len(d) < 100:
         raise ValueError(f"Not enough rows after indicator generation: {len(d)} rows remain.")
 

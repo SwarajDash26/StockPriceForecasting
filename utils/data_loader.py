@@ -75,28 +75,21 @@ def get_stock_data(ticker, prediction_date):
     normalized_ticker = str(ticker).upper().strip()
     prediction_date = pd.to_datetime(prediction_date).date()
 
-    # Calculate the start date as 3 years before the prediction date
     start_date = pd.Timestamp(prediction_date) - pd.DateOffset(years=3)
-    # Format dates for yfinance
     start_str = start_date.strftime('%Y-%m-%d')
-    # We need data up to and including the prediction date.
-    # Add 5 days to the prediction date to ensure we get it, then we'll trim later.
     end_date = pd.Timestamp(prediction_date) + pd.DateOffset(days=5)
     end_str = end_date.strftime('%Y-%m-%d')
 
     try:
         df = _download_with_fallbacks(normalized_ticker, start_str, end_str)
-        # Filter to only include dates up to the prediction date
         df = df[df.index.date <= prediction_date]
 
-        # Check if we have enough data
         if len(df) < MIN_HISTORY_ROWS:
             raise ValueError(
                 f"Not enough data for {normalized_ticker} on {prediction_date}. "
                 f"Only {len(df)} trading days were available; at least {MIN_HISTORY_ROWS} are required."
             )
         
-        # Add the ticker name to the DataFrame for reference
         df.name = normalized_ticker
         
         return df
@@ -104,10 +97,8 @@ def get_stock_data(ticker, prediction_date):
     except Exception as e:
         raise Exception(f"An error occurred while downloading data: {str(e)}")
 
-# Example usage for testing:
 if __name__ == "__main__":
-    # Test with a specific date
-    test_date = pd.to_datetime('2023-12-01').date() # Predict from Dec 1, 2023
+    test_date = pd.to_datetime('2023-12-01').date()
     data = get_stock_data('AAPL', test_date)
     print("Data downloaded successfully!")
     print(data.tail())

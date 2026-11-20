@@ -14,12 +14,10 @@ def create_target(df: pd.DataFrame, future_days: int = 5) -> pd.DataFrame:
     """
     df = df.copy()
 
-    # Handle MultiIndex columns just in case
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ["_".join(col).strip("_") for col in df.columns]
 
     if "Close" not in df.columns:
-        # Fallback: try to find a close-like column
         close_col = None
         for col in df.columns:
             c = col.lower()
@@ -33,7 +31,6 @@ def create_target(df: pd.DataFrame, future_days: int = 5) -> pd.DataFrame:
     future_close = df["Close"].shift(-future_days)
     df["Target"] = (future_close - df["Close"]) / df["Close"]
 
-    # Drop rows where target is NaN (last future_days)
     df = df.dropna(subset=["Target"])
     return df
 
@@ -61,7 +58,6 @@ def prepare_data_for_lstm(
 
     df = df.copy()
 
-    # Features: numeric columns except Target
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     if "Target" in numeric_cols:
         numeric_cols.remove("Target")
@@ -93,7 +89,6 @@ def prepare_data_for_lstm(
 
     scaled_features = feature_scaler.transform(features)
 
-    # Build sequences
     X, y = [], []
     # i is the "current" row index (sequence ends at i-1, predicts target at i)
     for i in range(n_steps, len(scaled_features)):
@@ -103,8 +98,6 @@ def prepare_data_for_lstm(
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.float32)
 
-    # Convert split from row space to sequence space:
-    # sequence index j corresponds to row i = n_steps + j
     train_seq_count = split_row - n_steps
 
     X_train = X[:train_seq_count]
@@ -121,7 +114,6 @@ def prepare_data_for_lstm(
 
 
 if __name__ == "__main__":
-    # Quick self-test (optional)
     from utils.data_loader import get_stock_data
     from utils.feature_engineer import add_technical_indicators
 

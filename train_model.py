@@ -35,7 +35,6 @@ def save_json(path: str, payload: dict):
 def plot_training_history(history, ticker: str, save_path: str):
     plt.figure(figsize=(12, 5))
 
-    # MAE
     plt.subplot(1, 2, 1)
     plt.plot(history.history.get("mae", []), label="train_mae")
     plt.plot(history.history.get("val_mae", []), label="val_mae")
@@ -44,7 +43,6 @@ def plot_training_history(history, ticker: str, save_path: str):
     plt.ylabel("MAE")
     plt.legend()
 
-    # Loss
     plt.subplot(1, 2, 2)
     plt.plot(history.history.get("loss", []), label="train_loss")
     plt.plot(history.history.get("val_loss", []), label="val_loss")
@@ -104,17 +102,14 @@ def train_stock_model(
     print(f"\nTraining {ticker} | predict {future_days}-day return | cutoff={prediction_date}")
     print("=" * 72)
 
-    # 1) Load data
     print("1) Loading data...")
     raw = get_stock_data(ticker, prediction_date)
     print(f"   Raw rows: {len(raw)} | cols: {list(raw.columns)}")
 
-    # 2) Technical features
     print("2) Engineering technical features...")
     feats = add_technical_indicators(raw)
     print(f"   Rows after indicators: {len(feats)} | feature cols: {list(feats.columns)}")
 
-    # 2.1) Sentiment features aligned by date
     print("2.1) Building sentiment features...")
     sent_daily, scored_headlines = build_daily_sentiment_features(
         ticker=ticker,
@@ -134,18 +129,15 @@ def train_stock_model(
     )
     print(f"   Headlines fetched/scored: {len(scored_headlines)}")
 
-    # 3) Target
     print("3) Creating target...")
     df = create_target(feats, future_days=future_days)
     print(f"   Rows after target drop: {len(df)}")
 
-    # 4) Sequences + leakage-free scaling
     print("4) Preparing sequences...")
     X_train, X_test, y_train, y_test, scaler, feature_columns = prepare_data_for_lstm(
         df, n_steps=n_steps, test_size=test_size
     )
 
-    # 5) Model
     print("5) Building model...")
     input_shape = (X_train.shape[1], X_train.shape[2])
     model = create_lstm_model(input_shape, learning_rate=learning_rate, show_summary=True)
@@ -205,7 +197,6 @@ def train_stock_model(
     print(f"   Test  MSE: {test_mse:.5f}")
     print(f"   Residual STD (test): {error_std:.5f} | 95% CI: ±{ci95:.5f}")
 
-    # 8) Save artifacts
     print("8) Saving artifacts...")
     model_path = f"models/{ticker}_lstm_model.keras"
     scaler_path = f"models/{ticker}_scaler.pkl"
@@ -232,7 +223,6 @@ def train_stock_model(
 
 
 if __name__ == "__main__":
-    # Default test run
     train_stock_model(
         ticker="AAPL",
         prediction_date="2023-12-01",

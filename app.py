@@ -19,9 +19,6 @@ from utils.sentiment import (
     summarize_sentiment_until_date,
 )
 
-# ----
-# Config
-# ----
 st.set_page_config(page_title="Stock Price Forecaster (DL + Sentiment)", layout="wide")
 
 N_STEPS = 60
@@ -40,9 +37,6 @@ ARTIFACT_DEPENDENCY_FILES = (
 ARTIFACT_MTIME_GRACE_SECONDS = 60
 
 
-# ----
-# Helpers
-# ----
 def _artifact_paths(ticker: str):
     return {
         "model": f"models/{ticker}_lstm_model.keras",
@@ -518,9 +512,6 @@ def render_headline_cards(headlines_scored: pd.DataFrame, limit: int = 12):
         )
 
 
-# ----
-# UI
-# ----
 st.title("Stock Price Forecaster")
 st.caption(
     "Forecasts the next 5-business-day move using an LSTM trained on price history, "
